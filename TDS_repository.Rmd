@@ -1,0 +1,285 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(edgeR)
+
+tds_genes = c(
+  "DIO1", "DIO2", "DUOX1", "DUOX2",
+  "FOXE1", "GLIS3", "NKX2-1", "PAX8",
+  "SLC26A4", "SLC5A5", "SLC5A8", "TG",
+  "TPO", "TSHR", "THRA", "THRB"
+)
+
+tumor_samples = read.csv(
+  "data/1tumor_samples_final_68.csv"
+) %>%
+  dplyr::select(sample_id, group) %>%
+  dplyr::distinct() %>%
+  mutate(tissue_type_simple = "Tumor")
+
+normal_samples = read.csv(
+  "data/1normal_samples_final_32.csv"
+) %>%
+  dplyr::select(sample_id, group) %>%
+  dplyr::distinct() %>%
+  mutate(tissue_type_simple = "Normal")
+
+all_samples = bind_rows(
+  tumor_samples,
+  normal_samples
+)
+
+rna = read.csv(
+  "data/raw rna/thyroid_rna_counts_112.csv",
+  check.names = FALSE
+)
+
+missing_samples = setdiff(
+  tumor_samples$sample_id,
+  colnames(rna)
+)
+
+rna_all = rna %>%
+  dplyr::select(
+    ensembl,
+    dplyr::all_of(all_samples$sample_id)
+  ) %>%
+  tibble::column_to_rownames("ensembl") %>%
+  as.matrix()
+
+storage.mode(rna_all) = "numeric"
+```
+
+```{r}
+dge_all = edgeR::DGEList(
+  counts = rna_all
+)
+
+dge_all = edgeR::calcNormFactors(
+  dge_all,
+  method = "TMM"
+)
+
+log_rna_all = edgeR::cpm(
+  dge_all,
+  log = TRUE,
+  prior.count = 1
+)
+```
+
+```{r}
+gene_map = readRDS(
+  "data/ensembl115_gene_map.rds"
+)
+
+log_rna_all_df = as.data.frame(
+  log_rna_all,
+  check.names = FALSE
+) %>%
+  tibble::rownames_to_column(
+    "ensembl_gene_id_raw"
+  ) %>%
+  mutate(
+    ensembl_gene_id = sub(
+      "\\..*$",
+      "",
+      ensembl_gene_id_raw
+    )
+  )
+
+tds_gene_map <- gene_map %>%
+  transmute(
+    ensembl_gene_id = sub(
+      "\\..*$",
+      "",
+      ensembl_gene_id
+    ),
+    hgnc_symbol = trimws(hgnc_symbol)
+  ) %>%
+  filter(
+    !is.na(hgnc_symbol),
+    hgnc_symbol != "",
+    hgnc_symbol %in% tds_genes
+  ) %>%
+  distinct(
+    ensembl_gene_id,
+    hgnc_symbol
+  )
+
+tds_expression_mapped <- log_rna_all_df %>%
+  inner_join(
+    tds_gene_map,
+    by = "ensembl_gene_id"
+  )
+
+tds_expression_mapped %>%
+  dplyr::count(
+    hgnc_symbol,
+    sort = TRUE
+  )
+```
+
+```{r}
+tds_expression_matrix = tds_expression_mapped %>%
+  dplyr::select(
+    hgnc_symbol,
+    dplyr::all_of(all_samples$sample_id)
+  ) %>%
+  tibble::column_to_rownames("hgnc_symbol") %>%
+  as.matrix()
+
+tds_expression_matrix = tds_expression_matrix[
+  tds_genes,
+  all_samples$sample_id,
+  drop = FALSE
+]
+
+storage.mode(tds_expression_matrix) <- "numeric"
+```
+
+```{r}
+mean_tds_expression = colMeans(
+  tds_expression_matrix,
+  na.rm = TRUE
+)
+
+mean_tds_expression_df = tibble(
+  sample_id = names(mean_tds_expression),
+  mean_log2_expression = as.numeric(
+    mean_tds_expression
+  )
+) %>%
+  left_join(
+    all_samples,
+    by = "sample_id"
+  ) %>%
+  mutate(
+    group = factor(
+      group,
+      levels = c(
+        "WTC-unexposed",
+        "WTC-exposed"
+      )
+    ),
+    tissue_type_simple = factor(
+      tissue_type_simple,
+      levels = c(
+        "Tumor",
+        "Normal"
+      )
+    )
+  )
+```
+
+```{r}
+mean_tds_expression_df = mean_tds_expression_df %>%
+  mutate(
+    group = factor(
+      group,
+      levels = c(
+        "WTC-exposed",
+        "WTC-unexposed"
+      )
+    )
+  )
+
+mean_expression_medians = mean_tds_expression_df %>%
+  group_by(
+    tissue_type_simple,
+    group
+  ) %>%
+  summarise(
+    median_expression = median(
+      mean_log2_expression,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    median_label = paste0(
+      "Median: ",
+      round(median_expression, 2)
+    )
+  )
+
+ggplot(
+  mean_tds_expression_df,
+  aes(
+    x = group,
+    y = mean_log2_expression,
+    fill = group
+  )
+) +
+  geom_boxplot(
+    width = 0.55,
+    outlier.shape = NA,
+    alpha = 0.75
+  ) +
+  geom_point(
+    size = 1.5,
+    alpha = 0.75
+  ) +
+  geom_text(
+    data = mean_expression_medians,
+    aes(
+      x = group,
+      y = median_expression,
+      label = median_label
+    ),
+    inherit.aes = FALSE,
+    nudge_x = 0.29,
+    nudge_y = 0.02,
+    hjust = 0,
+    size = 3.1
+  ) +
+  facet_wrap(
+    ~ tissue_type_simple
+  ) +
+  coord_cartesian(
+    clip = "off"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "WTC-unexposed" = "dodgerblue4",
+      "WTC-exposed" = "firebrick3"
+    )
+  ) +
+  scale_y_continuous(
+    expand = expansion(
+      mult = c(0.05, 0.25)
+    )
+  ) +
+  labs(
+    title = "Mean Expression of Thyroid Differentiation Genes",
+    x = NULL,
+    y = "Mean log2 Expression of TDS Genes"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(
+      size = 13,
+      face = "bold",
+      hjust = 0.5
+    ),
+    strip.text = element_text(
+      size = 11,
+      face = "bold"
+    ),
+    strip.background = element_rect(
+      fill = "grey90",
+      color = "black"
+    ),
+    panel.spacing.x = grid::unit(
+      1,
+      "lines"
+    ),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10),
+    axis.title.y = element_text(size = 11)
+  )
+```

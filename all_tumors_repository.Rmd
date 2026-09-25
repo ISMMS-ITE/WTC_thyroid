@@ -1,0 +1,485 @@
+
+```{r setup, include=TRUE}
+library(rprojroot)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r}
+library(tidyverse)
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+library(knitr)
+library(GSVA)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(pheatmap)
+library(readr)
+library(flextable)
+library(officer)
+library(fgsea)
+library(msigdbr)
+library(readxl)
+library(edgeR)
+library(limma)
+```
+
+```{r}
+rna = read.csv("data/raw rna/thyroid_rna_counts_112.csv")
+
+tumor_samples_final = read.csv("data/1tumor_samples_final_68.csv")
+
+tumor_rna = rna %>% 
+  dplyr::select(1, any_of(tumor_samples_final$sample_id))
+rownames(tumor_rna) = tumor_rna[[1]]
+tumor_rna = tumor_rna[ , -1]
+```
+
+```{r}
+tumor_clinical_dds = tumor_samples_final %>% 
+  dplyr::select(sample_id, group) %>% 
+  dplyr::slice(match(colnames(tumor_rna), sample_id))
+
+tumor_clinical_dds$group <- factor(
+  tumor_clinical_dds$group,
+  levels = c("WTC-unexposed", "WTC-exposed")
+)
+```
+
+```{r}
+rna_round = round(tumor_rna)
+
+dds = DESeqDataSetFromMatrix(
+  countData = rna_round,
+  colData   = tumor_clinical_dds,   
+  design    = ~ group     
+)
+```
+
+```{r}
+smallest_group = 3
+keep = rowSums(counts(dds) >= 10) >= smallest_group
+dds = dds[keep, ]
+```
+
+```{r}
+dds$group = relevel(dds$group, ref = "WTC-unexposed")
+dds = DESeq(dds)
+```
+
+```{r}
+res = results(dds, contrast = c("group", "WTC-exposed", "WTC-unexposed"))
+res = res[order(res$padj), ]
+res_df = as.data.frame(res)
+res_df$ensembl_id = rownames(res_df)
+res_df = res_df %>% filter(!is.na(padj))
+
+res_df = res_df %>%
+  dplyr::mutate(
+    significance = case_when(
+      padj < 0.05 & log2FoldChange > 1.5  ~ "Up",
+      padj < 0.05 & log2FoldChange < -1.5 ~ "Down",
+      TRUE                              ~ "Not Significant"
+    )
+  )
+```
+
+```{r}
+gene_map = readRDS("data/ensembl115_gene_map.rds")
+
+res_hgnc = merge(
+  res_df,
+  gene_map[, c("ensembl_gene_id", "hgnc_symbol", "gene_biotype")],
+  by.x = "ensembl_id",
+  by.y = "ensembl_gene_id",
+  all.x = TRUE  # keep all ensembl genes even if they don't map to hgnc
+)
+
+res_hgnc = res_hgnc %>% 
+  dplyr::filter(hgnc_symbol != "")
+
+res_hgnc = res_hgnc[, c("hgnc_symbol", "gene_biotype", setdiff(names(res_hgnc), c("hgnc_symbol","gene_biotype")))]
+
+duplicated_hgnc = res_hgnc$hgnc_symbol[duplicated(res_hgnc$hgnc_symbol)]
+dup_hgnc_deseq = res_hgnc[res_hgnc$hgnc_symbol %in% duplicated_hgnc, ]
+
+res_hgnc$hgnc_unique = ave(
+  res_hgnc$hgnc_symbol,
+  res_hgnc$hgnc_symbol,
+  FUN = function(x) {
+    if (length(x) == 1) {
+      x
+    } else {
+      paste0(x, ".", seq_along(x))
+    }
+  }
+)
+res_hgnc$hgnc_symbol = res_hgnc$hgnc_unique
+res_hgnc$hgnc_unique = NULL
+```
+
+```{r}
+res_hgnc_protein = res_hgnc %>% 
+  dplyr::filter(gene_biotype == "protein_coding")
+
+sig_genes = res_hgnc_protein[res_hgnc_protein$significance %in% c("Up", "Down"), ]
+top_genes = sig_genes[order(-abs(sig_genes$log2FoldChange)), ][1:40, ]
+
+volcano_hgnc_protein = ggplot(res_hgnc_protein, aes(x = log2FoldChange, y = -log10(padj), color = significance)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = c(-1.5, 1.5), linetype = "dashed", color = "black") +
+  
+  geom_text_repel(
+    data = top_genes,
+    aes(label = hgnc_symbol),
+    size = 3,
+    max.overlaps = Inf
+  ) +
+  
+  scale_color_manual(
+    values = c(
+      "Up" = "firebrick3",
+      "Down" = "dodgerblue4",
+      "Not Significant" = "grey"
+    ),
+    labels = c(
+      "Up" = "Upregulated",
+      "Down" = "Downregulated",
+      "Not Significant" = "Not Significant"
+    )
+  ) +
+  
+  theme_minimal() +
+  labs(
+    title = "",
+    x = "Log2 Fold Change (WTC-exposed vs WTC-unexposed)",
+    y = "-Log10 Adjusted P-value"
+  ) +
+  theme(legend.title = element_blank())
+
+```
+
+```{r}
+res_df$ensembl_id = sub("\\..*", "", res_df$ensembl_id)
+
+annot = bitr(
+  res_df$ensembl_id,
+  fromType = "ENSEMBL",
+  toType = c("GENETYPE"),
+  OrgDb = org.Hs.eg.db
+)
+res_annot = merge(
+  res_df,
+  annot,
+  by.x = "ensembl_id",
+  by.y = "ENSEMBL",
+  all.x = TRUE
+)
+
+res_protein_ensembl = res_annot[res_annot$GENETYPE == "protein-coding", ]
+
+res_protein_sig = res_protein_ensembl[res_protein_ensembl$significance %in% c("Up", "Down"), ]
+
+res_protein_sig = res_protein_sig[!is.na(res_protein_sig$padj), ]
+
+idx = match(res_protein_sig$ensembl_id, rownames(tumor_rna))
+idx = idx[!is.na(idx)]
+
+tumor_rna_de = tumor_rna[idx, , drop = FALSE]
+
+exposure_df = tumor_clinical_dds[
+  match(colnames(tumor_rna_de), tumor_clinical_dds$sample_id),
+]
+
+exposure_vector = exposure_df$group
+names(exposure_vector) = colnames(tumor_rna_de)
+
+col_order = c(
+  names(exposure_vector[exposure_vector == "WTC-unexposed"]),
+  names(exposure_vector[exposure_vector == "WTC-exposed"])
+)
+rna_ordered = tumor_rna_de[, col_order, drop = FALSE]
+
+annotation_col = data.frame(
+  Exposure = factor(exposure_vector[col_order],
+                    levels = c("WTC-unexposed", "WTC-exposed"))
+)
+rownames(annotation_col) = colnames(rna_ordered)
+
+rna_log = log2(rna_ordered + 1)
+
+case_cols = which(annotation_col$Exposure == "WTC-exposed")
+control_cols = which(annotation_col$Exposure == "WTC-unexposed")
+
+row_mean_case = rowMeans(rna_log[, case_cols, drop = FALSE])
+row_mean_control = rowMeans(rna_log[, control_cols, drop = FALSE])
+
+gene_order = order(row_mean_case - row_mean_control, decreasing = TRUE)
+top_rna_ordered = rna_log[gene_order, , drop = FALSE]
+
+pheatmap(
+  top_rna_ordered,
+  show_colnames = FALSE,
+  show_rownames = FALSE,
+  scale = "row",
+  annotation_col = annotation_col,
+  annotation_colors = list(
+    Exposure = c("WTC-unexposed" = "lightskyblue1",
+                 "WTC-exposed" = "royalblue4")
+  ),
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  treeheight_row = 0,
+  border_color = NA,
+  breaks = seq(-2.25, 2.25, length.out = 101)
+)
+```
+
+```{r}
+protein_up = res_hgnc_protein %>% 
+  filter(significance ==  "Up")
+up_genes = gsub("\\.[0-9]+$", "", protein_up$hgnc_symbol)
+up_genes = unique(up_genes)
+
+protein_down = res_hgnc_protein %>% 
+  filter(significance == "Down")
+down_genes = gsub("\\.[0-9]+$", "", protein_down$hgnc_symbol)
+down_genes = unique(down_genes)
+
+all_DE = res_hgnc_protein %>% 
+  filter(significance %in% c("Up", "Down"
+  ))
+all_DE = gsub("\\.[0-9]+$", "", all_DE$hgnc_symbol)
+all_DE = unique(all_DE)
+```
+
+```{r}
+msig_h = msigdbr(
+  species = "Homo sapiens",
+  collection = "H"
+)
+
+pathways = split(msig_h$ensembl_gene, msig_h$gs_name)
+```
+
+```{r}
+gene_list = res_protein_ensembl$log2FoldChange
+names(gene_list) = res_protein_ensembl$ensembl_id
+
+gene_list = gene_list[!is.na(gene_list)]
+gene_list = sort(gene_list, decreasing = TRUE)
+```
+
+```{r}
+fgseaRes = fgsea(
+  pathways = pathways,
+  stats    = gene_list
+)
+
+fgseaRes$pathway = gsub("HALLMARK_", "", fgseaRes$pathway)
+```
+
+```{r}
+fgsea_plot = fgseaRes %>%
+  mutate(
+    log10padj = -log10(padj),
+    log10padj = pmin(log10padj, 50),
+    significance = case_when(
+      padj < 0.05 & NES > 2  ~ "Over-enriched",
+      padj < 0.05 & NES < -2 ~ "Under-enriched",
+      TRUE                   ~ "Not Significant"
+    )
+  )
+
+volcano_gsea = ggplot(
+  fgsea_plot,
+  aes(x = NES, y = log10padj, color = significance)
+) +
+  geom_point(alpha = 0.6, size = 1.5) +
+
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = c(-2, 2), linetype = "dashed", color = "black") +
+
+  geom_text_repel(
+    data = subset(fgsea_plot, significance != "Not Significant"),
+    aes(label = pathway),
+    size = 3,
+    max.overlaps = 20
+  ) +
+
+  scale_color_manual(values = c(
+    "Over-enriched" = "firebrick3",
+    "Under-enriched" = "dodgerblue4",
+    "Not Significant" = "grey"
+  )) +
+
+  theme_minimal() +
+
+  labs(
+    title = " ",
+    x = "Normalized Enrichment Score (NES)",
+    y = "-Log10 Adjusted P-value"
+  ) +
+
+  theme(legend.title = element_blank())
+```
+
+```{r}
+ref = read_excel("data/haocheng_nanostring_ref.xlsx", sheet = 3)
+colnames(ref) = as.character(unlist(ref[1, ]))
+ref = ref[-1, ]
+
+celltype_markers = ref %>% 
+  dplyr::select(`HUGO Name`, `Cell Type`) %>% 
+  dplyr::filter(!is.na(`Cell Type`))
+
+celltype_sets = split(celltype_markers$`HUGO Name`, celltype_markers$`Cell Type`)
+```
+
+```{r}
+dge = DGEList(counts = tumor_rna)
+
+dge = calcNormFactors(dge)
+
+log_rna = cpm(dge, log = TRUE)
+```
+
+```{r}
+gene_map = readRDS("data/ensembl115_gene_map.rds")
+
+log_rna = as.data.frame(log_rna)
+log_rna$ensembl_gene_id = rownames(log_rna)
+log_rna_hgnc = merge(
+  log_rna,
+  gene_map[, c("ensembl_gene_id", "hgnc_symbol", "gene_biotype")],
+  by = "ensembl_gene_id",
+  all.x = TRUE
+)
+
+log_rna_hgnc = log_rna_hgnc %>% 
+  dplyr::filter(hgnc_symbol != "")
+
+log_rna_hgnc = log_rna_hgnc[, c("hgnc_symbol", "gene_biotype", setdiff(names(log_rna_hgnc), c("hgnc_symbol","gene_biotype")))]
+
+tumor_rna_norm_hgnc = log_rna_hgnc %>% 
+  dplyr::select(-ensembl_gene_id, -gene_biotype)
+
+tumor_rna_norm_hgnc = tumor_rna_norm_hgnc %>%
+  group_by(hgnc_symbol) %>%
+  slice_max(
+    order_by = rowMeans(across(where(is.numeric))),
+    n = 1,
+    with_ties = FALSE
+  ) %>%
+  ungroup() %>%
+  column_to_rownames("hgnc_symbol")
+```
+
+```{r}
+tumor_rna_norm_hgnc_protein = log_rna_hgnc %>% 
+  dplyr::filter(gene_biotype == "protein_coding")
+tumor_rna_norm_hgnc_protein = tumor_rna_norm_hgnc_protein %>% 
+  dplyr::select(-ensembl_gene_id, -gene_biotype)
+
+tumor_rna_norm_hgnc_protein = tumor_rna_norm_hgnc_protein %>%
+  group_by(hgnc_symbol) %>%
+  slice_max(
+    order_by = rowMeans(across(where(is.numeric))),
+    n = 1,
+    with_ties = FALSE
+  ) %>%
+  ungroup() %>%
+  column_to_rownames("hgnc_symbol")
+```
+
+```{r}
+tumor_rna_norm_hgnc_protein = as.matrix(tumor_rna_norm_hgnc_protein)
+
+param = gsvaParam(
+  exprData = tumor_rna_norm_hgnc_protein,
+  geneSets = celltype_sets,  
+  kcdf = "Gaussian",
+  maxDiff = TRUE
+)
+
+gsva_scores = gsva(param)
+```
+
+```{r}
+exposure_df = exposure_df[match(colnames(gsva_scores), exposure_df$sample_id), ]
+
+exposure_df$group = factor(exposure_df$group, levels = c("WTC-unexposed", "WTC-exposed"))
+
+annotation_col = data.frame(Exposure = exposure_df$group)
+rownames(annotation_col) = exposure_df$sample_id
+col_order  rownames(annotation_col)[order(annotation_col$Exposure)]
+gsva_scores = gsva_scores[, col_order, drop = FALSE]
+annotation_ordered = annotation_col[col_order, , drop = FALSE]
+
+gsva_group = factor(annotation_ordered$Exposure,
+                          levels = c("WTC-unexposed", "WTC-exposed")) 
+gsva_design = model.matrix(~ gsva_group)
+
+gsva_fit = lmFit(gsva_scores, gsva_design)
+
+gsva_fit = eBayes(gsva_fit)
+
+gsva_results = topTable(gsva_fit, 
+                              coef = "gsva_groupWTC-exposed", 
+                              number = Inf)
+gsva_results$pathway = rownames(gsva_results)
+
+gsva_results$significance = "Not Significant"
+gsva_results$significance[
+  gsva_results$adj.P.Val < 0.1 & gsva_results$logFC > 0
+] <- "Up"
+gsva_results$significance[
+  gsva_results$adj.P.Val < 0.1 & gsva_results$logFC < 0
+] <- "Down"
+
+gsva_results = gsva_results[, c(
+  "pathway", "logFC", "AveExpr", "t", 
+  "P.Value", "adj.P.Val", "significance"
+)]
+
+limma_gsva_results = gsva_results[order(gsva_results$adj.P.Val), ]
+limma_gsva_results$pathway = gsub("^HALLMARK_", "", limma_gsva_results$pathway)
+rownames(limma_gsva_results) = gsub("^HALLMARK_", "", rownames(limma_gsva_results))
+```
+
+```{r}
+set.seed(222)
+volcano_cell = ggplot(limma_gsva_results, 
+                       aes(x = logFC, y = -log10(adj.P.Val), color = significance)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  
+  # Threshold lines
+  geom_hline(yintercept = -log10(0.1), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = c(0), linetype = "dashed", color = "black") +
+
+  geom_text_repel(
+    data = limma_gsva_results,
+    aes(label = pathway),
+    size = 3,
+    max.overlaps = 20
+  ) +
+  
+  scale_color_manual(values = c("Up" = "firebrick3",
+                                "Down" = "dodgerblue4",
+                                "Not Significant" = "grey50"),
+    labels = c(
+      "Up" = "More abundant",
+      "Down" = "Less abundant",
+      "Not Significant" = "Not Significant"
+    )) +
+  
+  theme_minimal() +
+  labs(title = " ",
+       x = "Difference in Mean GSVA Score (WTC-exposed - WTC-unexposed)",
+       y = "-Log10 Adjusted P-value") +
+  theme(legend.title = element_blank())
+```
+
+
