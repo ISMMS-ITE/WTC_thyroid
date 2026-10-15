@@ -1,0 +1,309 @@
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(edgeR)
+
+tds_genes = c(
+  "DIO1", "DIO2", "DUOX1", "DUOX2",
+  "FOXE1", "GLIS3", "NKX2-1", "PAX8",
+  "SLC26A4", "SLC5A5", "SLC5A8", "TG",
+  "TPO", "TSHR", "THRA", "THRB"
+)
+
+tumor_samples = read.csv(
+  "data/1tumor_samples_final_68.csv"
+) %>%
+  dplyr::select(sample_id, group) %>%
+  dplyr::distinct() %>%
+  mutate(tissue_type_simple = "Tumor")
+
+rna = read.csv(
+  "data/raw rna/thyroid_rna_counts_112.csv",
+  check.names = FALSE
+)
+
+rna = rna %>%
+  dplyr::select(
+    ensembl,
+    dplyr::all_of(tumor_samples$sample_id)
+  ) %>%
+  tibble::column_to_rownames("ensembl") %>%
+  as.matrix()
+
+storage.mode(rna) = "numeric"
+```
+
+```{r}
+dge = edgeR::DGEList(
+  counts = rna
+)
+
+dge = edgeR::calcNormFactors(
+  dge,
+  method = "TMM"
+)
+
+log_rna = edgeR::cpm(
+  dge,
+  log = TRUE,
+  prior.count = 1
+)
+```
+
+```{r}
+gene_map = readRDS(
+  "data/ensembl115_gene_map.rds"
+)
+
+log_rna_df = as.data.frame(
+  log_rna,
+  check.names = FALSE
+) %>%
+  tibble::rownames_to_column(
+    "ensembl_gene_id_raw"
+  ) %>%
+  mutate(
+    ensembl_gene_id = sub(
+      "\\..*$",
+      "",
+      ensembl_gene_id_raw
+    )
+  )
+
+tds_gene_map = gene_map %>%
+  transmute(
+    ensembl_gene_id = sub(
+      "\\..*$",
+      "",
+      ensembl_gene_id
+    ),
+    hgnc_symbol = trimws(hgnc_symbol)
+  ) %>%
+  filter(
+    !is.na(hgnc_symbol),
+    hgnc_symbol != "",
+    hgnc_symbol %in% tds_genes
+  ) %>%
+  distinct(
+    ensembl_gene_id,
+    hgnc_symbol
+  )
+
+tds_expression_mapped = log_rna_df %>%
+  inner_join(
+    tds_gene_map,
+    by = "ensembl_gene_id"
+  )
+```
+
+```{r}
+tds_expression_matrix = tds_expression_mapped %>%
+  dplyr::select(
+    hgnc_symbol,
+    dplyr::all_of(tumor_samples$sample_id)
+  ) %>%
+  tibble::column_to_rownames("hgnc_symbol") %>%
+  as.matrix()
+
+tds_expression_matrix = tds_expression_matrix[
+  tds_genes,
+  tumor_samples$sample_id,
+  drop = FALSE
+]
+
+storage.mode(tds_expression_matrix) = "numeric"
+```
+
+```{r}
+tds_tumor_gene_medians = apply(
+  tds_expression_matrix,
+  1,
+  median,
+  na.rm = TRUE
+)
+
+tds_tumor_centered = sweep(
+  tds_expression_matrix,
+  1,
+  tds_tumor_gene_medians,
+  "-"
+)
+
+tds_tumor_scores = colMeans(
+  tds_tumor_centered,
+  na.rm = TRUE
+)
+
+
+tds_df = bind_rows(
+  tibble(
+    sample_id = names(tds_tumor_scores),
+    TDS = as.numeric(tds_tumor_scores),
+    tissue_type_simple = "Tumor"
+  )
+) %>%
+  left_join(
+    tumor_samples %>%
+      dplyr::select(
+        sample_id,
+        group
+      ),
+    by = "sample_id"
+  ) %>%
+  mutate(
+    group = factor(
+      group,
+      levels = c(
+        "WTC-unexposed",
+        "WTC-exposed"
+      )
+    )
+  )
+```
+
+```{r}
+tds_df = tibble(
+  sample_id = names(tds_tumor_scores),
+  TDS = as.numeric(tds_tumor_scores),
+  tissue_type_simple = "Tumor"
+) %>%
+  left_join(
+    tumor_samples %>%
+      dplyr::select(
+        sample_id,
+        group
+      ),
+    by = "sample_id"
+  ) %>%
+  mutate(
+    group = factor(
+      group,
+      levels = c(
+        "WTC-unexposed",
+        "WTC-exposed"
+      )
+    )
+  )
+
+tds_df = tds_df %>%
+  mutate(
+    group = factor(
+      group,
+      levels = c(
+        "WTC-exposed",
+        "WTC-unexposed"
+      )
+    )
+  )
+
+tds_medians = tds_df %>%
+  group_by(group) %>%
+  summarise(
+    median_TDS = median(
+      TDS,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    median_label = paste0(
+      "Median: ",
+      round(median_TDS, 2)
+    )
+  )
+
+ggplot(
+  tds_df,
+  aes(
+    x = group,
+    y = TDS,
+    fill = group
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+  geom_boxplot(
+    width = 0.55,
+    outlier.shape = NA,
+    alpha = 0.75
+  ) +
+  geom_point(
+    size = 1.5,
+    alpha = 0.75
+  ) +
+  geom_text(
+    data = tds_medians,
+    aes(
+      x = group,
+      y = median_TDS,
+      label = median_label
+    ),
+    inherit.aes = FALSE,
+    nudge_x = 0.29,
+    nudge_y = 0.02,
+    hjust = 0,
+    size = 3.1
+  ) +
+  coord_cartesian(
+    clip = "off"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "WTC-unexposed" = "dodgerblue4",
+      "WTC-exposed" = "firebrick3"
+    )
+  ) +
+  scale_y_continuous(
+    expand = expansion(
+      mult = c(0.05, 0.25)
+    )
+  ) +
+  labs(
+    title = "Thyroid Differentiation Score by WTC Exposure",
+    x = NULL,
+    y = "Thyroid Differentiation Score (TDS)"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(
+      size = 13,
+      face = "bold",
+      hjust = 0.5
+    ),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10),
+    axis.title.y = element_text(size = 11)
+  )
+```
+
+```{r}
+wilcox.test(
+  TDS ~ group,
+  data = tds_df,
+  exact = FALSE
+)
+```
+
+```{r}
+tds_iqr = tds_df %>%
+  group_by(group) %>%
+  summarise(
+    Q1 = quantile(TDS, 0.25, na.rm = TRUE),
+    median = median(TDS, na.rm = TRUE),
+    Q3 = quantile(TDS, 0.75, na.rm = TRUE),
+    IQR = IQR(TDS, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+tds_iqr
+```
+
